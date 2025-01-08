@@ -1,0 +1,201 @@
+name: Reusable workflow for backend infrastructure provisioning and application deployment 
+
+on:
+  workflow_call:
+    inputs:
+      github_repo_link:
+        description: "Application code GitHub repository URL"
+        required: true
+        type: string
+      github_owner:
+        description: "Application code GitHub repository Owner"
+        required: true
+        type: string
+      github_repo:
+        description: "Application code GitHub repository name. For ex., dia.git"
+        required: true
+        type: string
+      github_token: 
+        description: "Application code GitHub repository token for authentication"
+        required: true
+        type: string
+      aws_account_id:
+        description: 'AWS Account Id. Should be some number'
+        required: true
+        type: string
+      aws_region:
+        description: 'AWS Region where the infra and application needs to be deployed.'
+        required: true
+        type: string
+        default: 'us-east-1'
+      aws_access_key:
+        description: 'AWS Access Key'
+        required: true
+        type: string
+      aws_secret_access_key:
+        description: 'AWS Secret Access Key'
+        required: true
+        type: string
+      back_end_app_type:
+        description: "Choose the technology stack for the backend application (python, nodejs)"
+        required: false
+        type: string
+      back_end_app_directory:
+        description: "The directory path inside the GitHub repo where the backend application code is located"
+        required: false
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      TERRAFORM_VERSION: 1.5.7
+      APP_REPO_PATH: application_code
+      INFRA_REPO_PATH: infrastructure_code
+
+    steps:
+      - name: Checkout user repository (application code)
+        uses: actions/checkout@v3
+        with:
+          repository: "${{ github.event.inputs.github_owner }}/${{ github.event.inputs.github_repo }}"
+          token: ${{ github.event.inputs.github_token }}
+          ref: master 
+          path: ${{ env.APP_REPO_PATH }}
+        
+      - name: Get latest commit SHA from application repo
+        run : |
+          pushd ${{ env.APP_REPO_PATH }}
+          COMMIT_SHA=$(git rev-parse HEAD)
+          echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_ENV
+          popd
+        shell: bash
+
+      - name: Store AWS Credentials Securely
+        run: |
+          echo "AWS_ACCOUNT_ID=${{ github.event.inputs.aws_account_id }}" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ github.event.inputs.aws_region }}" >> $GITHUB_ENV
+          echo "AWS_ACCESS_KEY_ID=${{ github.event.inputs.aws_access_key }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ github.event.inputs.aws_secret_access_key }}" >> $GITHUB_ENV
+          echo "$GITHUB_ENV"
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Create ECR Repository
+        if: ${{ github.event.inputs.back_end_app_type != '' && contains('nodejs,python,html,java', github.event.inputs.back_end_app_type) }}
+        id: create-ecr
+        run: |
+          REPO_NAME=${{ github.event.inputs.back_end_app_type }}
+          if aws ecr describe-repositories --repository-names $REPO_NAME > /dev/null 2>&1; then
+            echo "Repository $REPO_NAME already exists. Skipping creation."
+          else
+            echo "Creating ECR repository for $REPO_NAME..."
+            aws ecr create-repository --repository-name $REPO_NAME
+            echo "Repository $REPO_NAME created successfully."
+          fi
+        env:
+          REPO_NAME: ${{ github.event.inputs.back_end_app_type }}
+
+      - name: Checkout repository (infra code)
+        uses: actions/checkout@v3
+        with:
+          path: ${{ env.INFRA_REPO_PATH }}
+          
+      - name: Build & Push Docker Image to ECR
+        if: ${{ github.event.inputs.back_end_app_type != '' && contains('nodejs,python,html,java', github.event.inputs.back_end_app_type) }}
+        run: |
+          echo "Building Docker image for backend application type: ${{ github.event.inputs.back_end_app_type }}..."
+           
+          # Define the path for the Dockerfile based on the backend app type
+          DOCKERFILE_PATH="${{ env.INFRA_REPO_PATH }}/infra/docker_files/${{ github.event.inputs.back_end_app_type }}/Dockerfile"
+          BACKEND_APP_DIRECTORY="${{ env.APP_REPO_PATH }}/${{ github.event.inputs.back_end_app_directory }}/"
+            
+          # Verify if the Dockerfile exists
+          if [[ ! -f "$DOCKERFILE_PATH" ]]; then
+            echo "Error: Dockerfile not found at $DOCKERFILE_PATH"
+            exit 1
+          fi
+
+          # Copy the Dockerfile to the backend application code directory to build an image of the code 
+          cp "$DOCKERFILE_PATH" "$BACKEND_APP_DIRECTORY"
+
+          # Build the Docker image
+          docker build -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} $BACKEND_APP_DIRECTORY
+          echo "Docker image built successfully: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} ${{ env.IMAGE_NAME }}:latest
+
+          echo "Authenticating Docker with ECR ..."
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.IMAGE_NAME }}
+
+          echo "Pushing Docker image for backend application type: ${{ github.event.inputs.back_end_app_type }}..."
+          docker push ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          docker push ${{ env.IMAGE_NAME }}:latest
+          echo "Docker image pushed successfully to ECR: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+          docker images
+        env:
+          IMAGE_NAME: "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ github.event.inputs.back_end_app_type }}" 
+          IMAGE_TAG: "${{ env.COMMIT_SHA }}"
+
+      - name: Authenticate with Terraform Cloud
+        env:
+          TF_CLI_CONFIG_FILE: $HOME/.terraformrc
+        run: |
+          echo "credentials \"app.terraform.io\" {
+            token = \"${{ secrets.TF_API_TOKEN }}\"
+          }" > $HOME/.terraformrc
+  
+      - name: Backend Terraform Init & Apply
+        if: ${{ contains('nodejs,python,html,java', github.event.inputs.back_end_app_type) && github.event.inputs.back_end_app_directory != '' && github.event.inputs.back_end_app_type != '' }}
+        run: |
+          echo "Provisioning backend infrastructure..."
+          pushd "${{ env.INFRA_REPO_PATH }}/infra/backend-app/environment"      
+
+          if [[ ${{ github.event.inputs.back_end_app_type }} == 'nodejs' ]]; then
+            echo "APPLICATION_PORT=8080" >> $GITHUB_ENV
+            export APPLICATION_PORT=8080
+          elif [[ ${{ github.event.inputs.back_end_app_type }} == 'python' ]]; then
+            echo "APPLICATION_PORT=5000" >> $GITHUB_ENV
+            export APPLICATION_PORT=5000
+          elif [[ ${{ github.event.inputs.back_end_app_type }} == 'html' ]]; then
+            echo "APPLICATION_PORT=80" >> $GITHUB_ENV
+            export APPLICATION_PORT=80
+          elif [[ ${{ github.event.inputs.back_end_app_type }} == 'java' ]]; then
+            echo "APPLICATION_PORT=12345" >> $GITHUB_ENV
+            export APPLICATION_PORT=12345
+          else
+            echo "Unsupported backend app type: ${{ github.event.inputs.back_end_app_type }}"
+          fi
+
+          echo "aws_account_id = \"${{ inputs.aws_account_id }}\"" > terraform.tfvars
+          echo "aws_region = \"${{ inputs.aws_region }}\"" >> terraform.tfvars
+          echo "aws_access_key = \"${{ inputs.aws_access_key }}\"" >> terraform.tfvars
+          echo "aws_secret_access_key = \"${{ inputs.aws_secret_access_key }}\"" >> terraform.tfvars
+          echo "image_name = \"${{ inputs.back_end_app_type }}\"" >> terraform.tfvars
+          echo "image_tag = \"${{ env.COMMIT_SHA }}\"" >> terraform.tfvars
+          echo "application_port = \"$APPLICATION_PORT\"" >> terraform.tfvars
+
+          cat terraform.tfvars
+
+          terraform init
+          terraform apply -auto-approve
+
+          popd
+
+      - name: Timestamp for backend infrastucture provisioning 
+        run: |
+          BACKEND_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "Backend infrastructure provisioned at: $BACKEND_TIMESTAMP"
+          echo "BACKEND_INFRA_PROVISION_TIMESTAMP=$BACKEND_TIMESTAMP" >> $GITHUB_ENV
+      
