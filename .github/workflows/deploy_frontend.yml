@@ -1,0 +1,170 @@
+name: Frontend infrastructure provisioning and application deployment
+
+on:
+  workflow_call:
+    inputs:
+      github_repo_link:
+        description: "Application code GitHub repository URL"
+        required: true
+        type: string
+      github_owner:
+        description: "Application code GitHub repository Owner"
+        required: true
+        type: string
+      github_repo:
+        description: "Application code GitHub repository name. For ex., dia.git"
+        required: true
+        type: string
+      github_token: 
+        description: "Application code GitHub repository token for authentication"
+        required: true
+        type: string
+      aws_account_id:
+        description: 'AWS Account Id. Should be some number'
+        required: true
+        type: string
+      aws_region:
+        description: 'AWS Region where the infra and application needs to be deployed.'
+        required: true
+        type: string
+        default: 'us-east-1'
+      aws_access_key:
+        description: 'AWS Access Key'
+        required: true
+        type: string
+      aws_secret_access_key:
+        description: 'AWS Secret Access Key'
+        required: true
+        type: string
+      front_end_app_type:
+        description: "Choose the technology stack for the frontend application (html, reactjs)"
+        required: false
+        type: string
+      front_end_app_directory:
+        description: "The directory path inside the GitHub repo where the frontend application code is located"
+        required: false
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      TERRAFORM_VERSION: 1.5.7
+      APP_REPO_PATH: application_code
+      INFRA_REPO_PATH: infrastructure_code
+
+    steps:
+      - name: Checkout user repository (application code)
+        uses: actions/checkout@v3
+        with:
+          repository: "${{ github.event.inputs.github_owner }}/${{ github.event.inputs.github_repo }}"
+          token: ${{ github.event.inputs.github_token }}
+          ref: master
+          path: ${{ env.APP_REPO_PATH }}
+        
+      - name: Store AWS Credentials Securely
+        run: |
+          echo "AWS_ACCOUNT_ID=${{ github.event.inputs.aws_account_id }}" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ github.event.inputs.aws_region }}" >> $GITHUB_ENV
+          echo "AWS_ACCESS_KEY_ID=${{ github.event.inputs.aws_access_key }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ github.event.inputs.aws_secret_access_key }}" >> $GITHUB_ENV
+          echo "$GITHUB_ENV"
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Checkout repository (infra code)
+        uses: actions/checkout@v3
+        with:
+          path: ${{ env.INFRA_REPO_PATH }}
+          
+      - name: Set up Node.js ()
+        if: ${{ github.event.inputs.front_end_app_directory != '' && github.event.inputs.front_end_app_type != '' }}
+        uses: actions/setup-node@v2
+        with:
+          node-version: 20.10.0
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Authenticate with Terraform Cloud
+        env:
+          TF_CLI_CONFIG_FILE: $HOME/.terraformrc
+        run: |
+          echo "credentials \"app.terraform.io\" {
+            token = \"${{ secrets.TF_API_TOKEN }}\"
+          }" > $HOME/.terraformrc
+
+      - name: Frontend infrstrature provisioning
+        if: ${{ github.event.inputs.front_end_app_directory != '' && github.event.inputs.front_end_app_type != '' }}
+        run: |
+
+          echo "Provisioning infrastructure for frontend application ..."
+          pushd "${{ env.INFRA_REPO_PATH }}/infra/frontend-app/environment"  
+
+          echo "aws_region = \"${{ inputs.aws_region }}\"" > terraform.tfvars
+          echo "aws_access_key = \"${{ inputs.aws_access_key }}\"" >> terraform.tfvars
+          echo "aws_secret_access_key = \"${{ inputs.aws_secret_access_key }}\"" >> terraform.tfvars
+
+          cat terraform.tfvars
+
+          terraform init
+          terraform apply -auto-approve
+
+          popd
+
+      - name: Timestamp for frontend infrastucture provisioning 
+        run: |
+          FRONTEND_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "Frontend infrastructure provisioned at: $FRONTEND_TIMESTAMP"
+          echo "FRONTEND_INFRA_PROVISION_TIMESTAMP=$FRONTEND_TIMESTAMP" >> $GITHUB_ENV
+
+      - name: Deploy HTML frontend application 
+        if: ${{ github.event.inputs.front_end_app_type == 'html' && github.event.inputs.front_end_app_directory != '' }}
+        run: |
+          echo "Deploying HTML frontend application ..."
+          pushd "${{ env.APP_REPO_PATH }}/${{ github.event.inputs.front_end_app_directory }}"
+          LATEST_BUCKET=$(aws s3api list-buckets --query "Buckets" --output json | jq -r 'max_by(.CreationDate) | .Name')
+          echo "Latest bucket: $LATEST_BUCKET"            
+          aws s3 cp . "s3://$LATEST_BUCKET/" --recursive
+          popd
+
+      - name: Update .env File with Task Definition Public IP
+        if: ${{ github.event.inputs.front_end_app_type == 'reactjs' && github.event.inputs.front_end_app_directory != '' }}
+        run: |
+          echo "Fetching the public IP address of the backend service..."
+          sleep 120
+          CLUSTER_NAME=$(aws ecs list-clusters --query 'clusterArns[0]' --output text | awk -F/ '{print $NF}')
+          SERVICE_NAME=$(aws ecs list-services --cluster $CLUSTER_NAME --query 'serviceArns[0]' --output text | awk -F/ '{print $NF}')
+          TASK_ARN=$(aws ecs list-tasks --cluster $CLUSTER_NAME --service-name $SERVICE_NAME --query 'taskArns[0]' --output text)
+          ENI_ID=$(aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK_ARN --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text)
+          TASK_DEFINITION_PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+
+          echo "Task Definition Public IP: $TASK_DEFINITION_PUBLIC_IP"
+
+          echo "Updating .env file with Task Definition Public IP..."
+          sed -i "s|http://localhost:8080|http://$TASK_DEFINITION_PUBLIC_IP:8080|g" ${{ env.APP_REPO_PATH }}/${{ github.event.inputs.front_end_app_directory }}/.env
+          echo ".env file updated successfully."
+          cat ${{ env.APP_REPO_PATH }}/${{ github.event.inputs.front_end_app_directory }}/.env
+        
+      - name: Build and Deploy React frontend application
+        if: ${{ github.event.inputs.front_end_app_type == 'reactjs' && github.event.inputs.front_end_app_directory != '' }}
+        run: |
+          echo "Deploying REACT frontend application ..."
+          pushd "${{ env.APP_REPO_PATH }}/${{ github.event.inputs.front_end_app_directory }}"
+          npm install
+          npm run build
+          pushd build/
+          LATEST_BUCKET=$(aws s3api list-buckets --query "Buckets" --output json | jq -r 'max_by(.CreationDate) | .Name')
+          echo "Latest bucket: $LATEST_BUCKET"            
+          aws s3 cp . "s3://$LATEST_BUCKET/" --recursive
+          popd
+          popd
